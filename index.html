@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Garment Floor Tracker</title>
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#1F2318" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  body { -webkit-tap-highlight-color: transparent; overscroll-behavior: none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+const SIZES = ["S", "M", "L", "XL", "XXL"];
+const STORE_KEY = "garment-tracker-data-v1";
+
+const emptySizeMap = () => ({ S: 0, M: 0, L: 0, XL: 0, XXL: 0 });
+const sumSizeMap = (m) => SIZES.reduce((a, s) => a + (Number(m[s]) || 0), 0);
+const uid = () => Math.random().toString(36).slice(2, 10);
+const money = (n) => "₹" + (Number(n) || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+const todayISO = () => new Date().toISOString().slice(0, 10);
+
+const initialData = {
+  fabricRolls: [], cuttingJobs: [], stitchIssues: [], stitchReceipts: [],
+  payments: [], packagingRecords: [], sales: [],
+};
+
+function loadData() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return initialData;
+}
+
+function GarmentTracker() {
+  const [data, setData] = useState(loadData);
+  const [tab, setTab] = useState("dashboard");
+
+  useEffect(() => {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); } catch (e) {}
+  }, [data]);
+
+  const update = (key, fn) => setData((d) => ({ ...d, [key]: fn(d[key]) }));
+
+  const derived = useMemo(() => {
+    const cutStock = {};
+    const key = (d, s) => d + "__" + s;
+
+    data.cuttingJobs.forEach((job) => {
+      SIZES.forEach((s) => {
+        const k = key(job.designName, s);
+        cutStock[k] = cutStock[k] || { design: job.designName, size: s, cut: 0, issued: 0 };
+        cutStock[k].cut += Number(job.cutQty[s]) || 0;
+      });
+    });
+    data.stitchIssues.forEach((iss) => {
+      SIZES.forEach((s) => {
+        const k = key(iss.designName, s);
+        cutStock[k] = cutStock[k] || { design: iss.designName, size: s, cut: 0, issued: 0 };
+        cutStock[k].issued += Number(iss.qty[s]) || 0;
+      });
+    });
+
+    const fabricCostPerDesign = {};
+    data.cuttingJobs.forEach((job) => {
+      const roll = data.fabricRolls.find((r) => r.id === job.rollId);
+      const costPerMeter = roll ? Number(roll.costPerMeter) || 0 : 0;
+      const totalPieces = sumSizeMap(job.cutQty);
+      const costPerPiece = totalPieces > 0 ? (Number(job.metersUsed) * costPerMeter) / totalPieces : 0;
+      const bucket = fabricCostPerDesign[job.designName] || { total: 0, count: 0 };
+      bucket.total += costPerPiece; bucket.count += 1;
+      fabricCostPerDesign[job.designName] = bucket;
+    });
+    const avgFabricCost = (design) => {
+      const b = fabricCostPerDesign[design];
+      return b && b.count ? b.total / b.count : 0;
+    };
+
+    const stitchedPool = {};
+    data.stitchReceipts.forEach((r) => {
+      SIZES.forEach((s) => {
+        const k = key(r.designName, s);
+        stitchedPool[k] = stitchedPool[k] || { design: r.designName, size: s, completed: 0 };
+        stitchedPool[k].completed += Number(r.qty[s]) || 0;
+      });
+    });
+    data.packagingRecords.forEach((p) => {
+      const k = key(p.designName, p.size);
+      stitchedPool[k] = stitchedPool[k] || { design: p.designName, size: p.size, completed: 0 };
+      stitchedPool[k].packaged = (stitchedPool[k].packaged || 0) + Number(p.qty);
+    });
+
+    const stitchCostPerDesign = {};
+    data.stitchReceipts.forEach((r) => {
+      const bucket = stitchCostPerDesign[r.designName] || { total: 0, count: 0 };
+      bucket.total += (Number(r.stitchCost) || 0) + (Number(r.trimCost) || 0);
+      bucket.count += 1;
+      stitchCostPerDesign[r.designName] = bucket;
+    });
+    const avgStitchCost = (design) => {
+      const b = stitchCostPerDesign[design];
+      return b && b.count ? b.total / b.count : 0;
+    };
+
+    const finishedStock = {};
+    data.packagingRecords.forEach((p) => {
+      const k = key(p.designName, p.size);
+      finishedStock[k] = finishedStock[k] || { design: p.designName, size: p.size, qty: 0 };
+      finishedStock[k].qty += Number(p.qty);
+      finishedStock[k].landedCost = avgFabricCost(p.designName) + avgStitchCost(p.designName);
+    });
+    data.sales.forEach((s) => {
+      const k = key(s.designName, s.size);
+      if (finishedStock[k]) finishedStock[k].qty -= Number(s.qty);
+    });
+
+    const tailorLedger = {};
+    data.stitchReceipts.forEach((r) => {
+      const completed = sumSizeMap(r.qty);
+      const rate = Number(r.stitchCost) || 0;
+      const t = tailorLedger[r.tailorName] || { name: r.tailorName, pieces: 0, payable: 0, paid: 0 };
+      t.pieces += completed; t.payable += completed * rate;
+      tailorLedger[r.tailorName] = t;
+    });
+    data.payments.forEach((p) => {
+      const t = tailorLedger[p.tailorName] || { name: p.tailorName, pieces: 0, payable: 0, paid: 0 };
+      t.paid += Number(p.amount) || 0;
+      tailorLedger[p.tailorName] = t;
+    });
+
+    const salesByDesign = {};
+    data.sales.forEach((s) => {
+      const revenue = Number(s.qty) * Number(s.price);
+      const unitCost = avgFabricCost(s.designName) + avgStitchCost(s.designName);
+      const totalCost = unitCost * Number(s.qty);
+      const bucket = salesByDesign[s.designName] || { design: s.designName, qty: 0, revenue: 0, cost: 0 };
+      bucket.qty += Number(s.qty); bucket.revenue += revenue; bucket.cost += totalCost;
+      salesByDesign[s.designName] = bucket;
+    });
+
+    const totalFabricRemaining = data.fabricRolls.reduce((a, r) => a + (Number(r.remainingMeters) || 0), 0);
+    const wipCutting = Object.values(cutStock).reduce((a, c) => a + Math.max(c.cut - c.issued, 0), 0);
+    const wipStitching = Object.values(stitchedPool).reduce((a, c) => a + Math.max((c.completed || 0) - (c.packaged || 0), 0), 0);
+    const finishedBySize = SIZES.reduce((acc, s) => {
+      acc[s] = Object.values(finishedStock).filter((f) => f.size === s).reduce((a, f) => a + Math.max(f.qty, 0), 0);
+      return acc;
+    }, {});
+
+    const todayStr = todayISO();
+    const thisMonth = todayStr.slice(0, 7);
+    let salesToday = 0, profitToday = 0, salesMonth = 0, profitMonth = 0;
+    data.sales.forEach((s) => {
+      const revenue = Number(s.qty) * Number(s.price);
+      const unitCost = avgFabricCost(s.designName) + avgStitchCost(s.designName);
+      const profit = revenue - unitCost * Number(s.qty);
+      if (s.date === todayStr) { salesToday += revenue; profitToday += profit; }
+      if ((s.date || "").slice(0, 7) === thisMonth) { salesMonth += revenue; profitMonth += profit; }
+    });
+
+    return {
+      cutStock: Object.values(cutStock), stitchedPool: Object.values(stitchedPool),
+      finishedStock: Object.values(finishedStock), tailorLedger: Object.values(tailorLedger),
+      salesByDesign: Object.values(salesByDesign), totalFabricRemaining, wipCutting, wipStitching,
+      finishedBySize, salesToday, profitToday, salesMonth, profitMonth, avgFabricCost, avgStitchCost,
+    };
+  }, [data]);
+
+  const TABS = [
+    { id: "dashboard", label: "Dashboard", icon: "📊" },
+    { id: "fabric", label: "Fabric", icon: "🧵" },
+    { id: "cutting", label: "Cutting", icon: "✂️" },
+    { id: "stitching", label: "Stitching", icon: "👕" },
+    { id: "finished", label: "Finished", icon: "📦" },
+    { id: "sales", label: "Sales", icon: "🛍️" },
+  ];
+
+  return (
+    <div className="min-h-screen bg-[#F5F3EE] text-[#1F2318] font-sans pb-20">
+      <header className="bg-[#1F2318] text-[#F5F3EE] px-4 py-4 sticky top-0 z-20 shadow-md">
+        <h1 className="text-lg font-bold tracking-tight flex items-center gap-2">
+          <span className="text-[#C99A3B]">👕</span> Garment Floor Tracker
+        </h1>
+      </header>
+      <main className="max-w-3xl mx-auto p-3">
+        {tab === "dashboard" && <Dashboard derived={derived} setTab={setTab} />}
+        {tab === "fabric" && <FabricPage data={data} update={update} />}
+        {tab === "cutting" && <CuttingPage data={data} update={update} derived={derived} />}
+        {tab === "stitching" && <StitchingPage data={data} update={update} derived={derived} />}
+        {tab === "finished" && <FinishedPage data={data} update={update} derived={derived} />}
+        {tab === "sales" && <SalesPage data={data} update={update} derived={derived} />}
+      </main>
+      <nav className="fixed bottom-0 left-0 right-0 bg-[#1F2318] border-t border-black/20 flex justify-around py-1.5 z-20">
+        {TABS.map(({ id, label, icon }) => (
+          <button key={id} onClick={() => setTab(id)}
+            className={"flex flex-col items-center gap-0.5 px-2 py-1.5 rounded-lg text-[10px] font-medium " + (tab === id ? "text-[#C99A3B]" : "text-[#F5F3EE]/50")}>
+            <span className="text-base leading-none">{icon}</span>{label}
+          </button>
+        ))}
+      </nav>
+    </div>
+  );
+}
+
+function Section({ title, children, right }) {
+  return (
+    <div className="mb-4">
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="text-sm font-bold uppercase tracking-wide text-[#1F2318]/70">{title}</h2>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+function Card({ children, className }) {
+  return <div className={"bg-white rounded-xl border border-black/5 shadow-sm p-3 " + (className || "")}>{children}</div>;
+}
+function Field({ label, children }) {
+  return (
+    <label className="block mb-2">
+      <span className="block text-xs font-medium text-[#1F2318]/60 mb-1">{label}</span>
+      {children}
+    </label>
+  );
+}
+const inputCls = "w-full rounded-lg border border-black/10 px-3 py-2 text-sm bg-[#FAFAF7] focus:outline-none focus:ring-2 focus:ring-[#C99A3B]";
+function TextInput(props) { return <input {...props} className={inputCls} />; }
+function SelectInput({ children, ...props }) { return <select {...props} className={inputCls}>{children}</select>; }
+function SizeGrid({ value, onChange }) {
+  return (
+    <div className="grid grid-cols-5 gap-1.5">
+      {SIZES.map((s) => (
+        <label key={s} className="text-center">
+          <span className="block text-[10px] font-semibold text-[#1F2318]/50 mb-0.5">{s}</span>
+          <input type="number" min="0" value={value[s] || ""} onChange={(e) => onChange({ ...value, [s]: e.target.value })}
+            className="w-full rounded-md border border-black/10 px-1 py-1.5 text-sm text-center bg-[#FAFAF7]" />
+        </label>
+      ))}
+    </div>
+  );
+}
+function AddButton({ onClick, label }) {
+  return (
+    <button onClick={onClick} className="flex items-center gap-1 bg-[#1F2318] text-[#F5F3EE] text-xs font-semibold px-3 py-1.5 rounded-lg">
+      + {label || "Add"}
+    </button>
+  );
+}
+function Modal({ title, onClose, children }) {
+  return (
+    <div className="fixed inset-0 bg-black/40 z-30 flex items-end sm:items-center justify-center">
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl w-full sm:max-w-md max-h-[85vh] overflow-y-auto p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-bold text-sm">{title}</h3>
+          <button onClick={onClose}>✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+function EmptyState({ text }) { return <div className="text-center text-sm text-[#1F2318]/40 py-8">{text}</div>; }
+
+function Dashboard({ derived, setTab }) {
+  const stat = (label, value, warn) => (
+    <Card className="flex-1 min-w-[140px]">
+      <div className="text-[10px] uppercase font-semibold text-[#1F2318]/40">{label}</div>
+      <div className={"text-xl font-bold mt-1 " + (warn ? "text-red-600" : "")}>{value}</div>
+    </Card>
+  );
+  return (
+    <div>
+      <Section title="Key Metrics">
+        <div className="flex flex-wrap gap-2 mb-2">
+          {stat("Raw Fabric Stock", derived.totalFabricRemaining.toFixed(1) + " m")}
+          {stat("WIP: Cutting → Stitching", derived.wipCutting)}
+          {stat("WIP: In Stitching", derived.wipStitching)}
+          {stat("Sales Today", money(derived.salesToday))}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {stat("Profit Today", money(derived.profitToday))}
+          {stat("Sales This Month", money(derived.salesMonth))}
+          {stat("Profit This Month", money(derived.profitMonth))}
+        </div>
+      </Section>
+      <Section title="Finished Stock by Size">
+        <Card>
+          <div className="grid grid-cols-5 gap-2 text-center">
+            {SIZES.map((s) => (
+              <div key={s}>
+                <div className="text-[10px] text-[#1F2318]/40 font-semibold">{s}</div>
+                <div className="text-lg font-bold">{derived.finishedBySize[s]}</div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      </Section>
+      <Section title="Quick Actions">
+        <div className="grid grid-cols-2 gap-2">
+          <button onClick={() => setTab("fabric")} className="bg-white border border-black/10 rounded-xl p-3 text-left text-sm font-semibold">+ Receive Fabric</button>
+          <button onClick={() => setTab("cutting")} className="bg-white border border-black/10 rounded-xl p-3 text-left text-sm font-semibold">+ Record Cutting</button>
+          <button onClick={() => setTab("stitching")} className="bg-white border border-black/10 rounded-xl p-3 text-left text-sm font-semibold">+ Issue to Stitching</button>
+          <button onClick={() => setTab("sales")} className="bg-white border border-black/10 rounded-xl p-3 text-left text-sm font-semibold">+ Record Sale</button>
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+function FabricPage({ data, update }) {
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({ name: "", code: "", vendor: "", meters: "", cost: "", date: todayISO(), notes: "" });
+  const save = () => {
+    if (!form.name || !form.meters) return;
+    update("fabricRolls", (rolls) => [...rolls, {
+      id: uid(), name: form.name, code: form.code || ("ROLL-" + (rolls.length + 1)), vendor: form.vendor,
+      totalMeters: Number(form.meters), remainingMeters: Number(form.meters), costPerMeter: Number(form.cost) || 0,
+      receivedDate: form.date, notes: form.notes,
+    }]);
+    setForm({ name: "", code: "", vendor: "", meters: "", cost: "", date: todayISO(), notes: "" });
+    setOpen(false);
+  };
+  return (
+    <div>
+      <Section title="Raw Fabric Stock" right={<AddButton onClick={() => setOpen(true)} label="Receive Fabric" />}>
+        {data.fabricRolls.length === 0 ? <EmptyState text="No fabric received yet. Tap 'Receive Fabric' to log your first roll." /> : (
+          <div className="space-y-2">
+            {data.fabricRolls.map((r) => (
+              <Card key={r.id}>
+                <div className="flex justify-between items-start">
+                  <div>
+                    <div className="font-semibold text-sm">{r.name}</div>
+                    <div className="text-xs text-[#1F2318]/50">{r.code} · {r.vendor}</div>
+                  </div>
+                  {r.remainingMeters <= 0 && <span className="text-[10px] bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-semibold">EXHAUSTED</span>}
+                </div>
+                <div className="grid grid-cols-3 gap-2 mt-2 text-xs">
+                  <div><div className="text-[#1F2318]/40">Remaining</div><div className="font-bold">{r.remainingMeters} m</div></div>
+                  <div><div className="text-[#1F2318]/40">Cost/m</div><div className="font-bold">{money(r.costPerMeter)}</div></div>
+                  <div><div className="text-[#1F2318]/40">Value</div><div className="font-bold">{money(r.remainingMeters * r.costPerMeter)}</div></div>
+                </div>
+              </Card>
+            ))}
+          </div>
+        )}
+      </Section>
+      {open && (
+        <Modal title="Receive Fabric Roll" onClose={() => setOpen(false)}>
+          <Field label="Fabric Type/Name"><TextInput value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cotton Twill Navy" /></Field>
+          <Field label="Roll ID / Code"><TextInput value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} placeholder="Optional, auto-generated if blank" /></Field>
+          <Field label="Vendor Name"><TextInput value={form.vendor} onChange={(e) => setForm({ ...form, vendor: e.target.value })} /></Field>
+          <Field label="Total Meters Received"><TextInput type="number" value={form.meters} onChange={(e) => setForm({ ...form, meters: e.target.value })} /></Field>
+          <Field label="Cost per Meter"><TextInput type="number" value={form.cost} onChange={(e) => setForm({ ...form, cost: e.target.value })} /></Field>
+          <Field label="Received Date"><TextInput type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
+          <Field label="Remarks/Notes"><TextInput value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field>
+          <button onClick={save} className="w-full bg-[#1F2318] text-[#F5F3EE] font-semibold py-2.5 rounded-lg mt-2">Save Roll</button>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function CuttingPage({ data, update, derived }) {
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({ rollId: "", meters: "", design: "", qty: emptySizeMap() });
+  const save = () => {
+    if (!form.rollId || !form.design || !form.meters) return;
+    update("cuttingJobs", (jobs) => [...jobs, { id: uid(), rollId: form.rollId, metersUsed: Number(form.meters), designName: form.design, cutQty: form.qty, date: todayISO() }]);
+    update("fabricRolls", (rolls) => rolls.map((r) => r.id === form.rollId ? { ...r, remainingMeters: Math.max(r.remainingMeters - Number(form.meters), 0) } : r));
+    setForm({ rollId: "", meters: "", design: "", qty: emptySizeMap() });
+    setOpen(false);
+  };
+  const totalPieces = sumSizeMap(form.qty);
+  const yieldPerPiece = totalPieces > 0 && form.meters ? (Number(form.meters) / totalPieces).toFixed(3) : "-";
+  return (
+    <div>
+      <Section title="Cut Pieces Stock (Unstitched)" right={<AddButton onClick={() => setOpen(true)} label="Log Cutting" />}>
+        {derived.cutStock.filter((c) => c.cut > 0).length === 0 ? <EmptyState text="No cutting jobs logged yet." /> : (
+          <div className="space-y-1.5">
+            {derived.cutStock.filter((c) => c.cut > 0).map((c, i) => (
+              <Card key={i} className="flex justify-between items-center">
+                <div>
+                  <div className="font-semibold text-sm">{c.design}</div>
+                  <div className="text-xs text-[#1F2318]/50">Size {c.size} · Fabric cost/pc {money(derived.avgFabricCost(c.design))}</div>
+                </div>
+                <div className="text-right">
+                  <div className="font-bold">{Math.max(c.cut - c.issued, 0)}</div>
+                  <div className="text-[10px] text-[#1F2318]/40">available</div>
+                </div>
+              </Card>
+            ))}
+          </div>
+        )}
+      </Section>
+      {open && (
+        <Modal title="Log Cutting Job" onClose={() => setOpen(false)}>
+          <Field label="Select Raw Fabric Roll">
+            <SelectInput value={form.rollId} onChange={(e) => setForm({ ...form, rollId: e.target.value })}>
+              <option value="">Choose roll…</option>
+              {data.fabricRolls.filter((r) => r.remainingMeters > 0).map((r) => (
+                <option key={r.id} value={r.id}>{r.name} ({r.code}) — {r.remainingMeters}m left</option>
+              ))}
+            </SelectInput>
+          </Field>
+          <Field label="Meters Used from Roll"><TextInput type="number" value={form.meters} onChange={(e) => setForm({ ...form, meters: e.target.value })} /></Field>
+          <Field label="Design/Style Name"><TextInput value={form.design} onChange={(e) => setForm({ ...form, design: e.target.value })} placeholder="Men's Cotton Shirt - Navy" /></Field>
+          <Field label="Cut Quantity Output by Size"><SizeGrid value={form.qty} onChange={(v) => setForm({ ...form, qty: v })} /></Field>
+          <div className="text-xs text-[#1F2318]/50 mb-2">Yield: {yieldPerPiece} m/piece · {totalPieces} pieces total</div>
+          <button onClick={save} className="w-full bg-[#1F2318] text-[#F5F3EE] font-semibold py-2.5 rounded-lg mt-1">Save Cutting Job</button>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function StitchingPage({ data, update, derived }) {
+  const [subTab, setSubTab] = useState("issue");
+  const [issueOpen, setIssueOpen] = useState(false);
+  const [receiveOpen, setReceiveOpen] = useState(false);
+  const [payOpen, setPayOpen] = useState(false);
+  const [issueForm, setIssueForm] = useState({ tailor: "", design: "", qty: emptySizeMap(), date: todayISO() });
+  const [recvForm, setRecvForm] = useState({ tailor: "", design: "", qty: emptySizeMap(), rejected: "", stitchCost: "", trimCost: "" });
+  const [payForm, setPayForm] = useState({ tailor: "", amount: "" });
+  const availableDesigns = derived.cutStock.filter((c) => c.cut - c.issued > 0);
+
+  const saveIssue = () => {
+    if (!issueForm.tailor || !issueForm.design) return;
+    update("stitchIssues", (arr) => [...arr, { id: uid(), tailorName: issueForm.tailor, designName: issueForm.design, qty: issueForm.qty, promisedDate: issueForm.date }]);
+    setIssueForm({ tailor: "", design: "", qty: emptySizeMap(), date: todayISO() });
+    setIssueOpen(false);
+  };
+  const saveReceive = () => {
+    if (!recvForm.tailor || !recvForm.design) return;
+    update("stitchReceipts", (arr) => [...arr, { id: uid(), tailorName: recvForm.tailor, designName: recvForm.design, qty: recvForm.qty, rejected: Number(recvForm.rejected) || 0, stitchCost: Number(recvForm.stitchCost) || 0, trimCost: Number(recvForm.trimCost) || 0, date: todayISO() }]);
+    setRecvForm({ tailor: "", design: "", qty: emptySizeMap(), rejected: "", stitchCost: "", trimCost: "" });
+    setReceiveOpen(false);
+  };
+  const savePayment = () => {
+    if (!payForm.tailor || !payForm.amount) return;
+    update("payments", (arr) => [...arr, { id: uid(), tailorName: payForm.tailor, amount: Number(payForm.amount), date: todayISO() }]);
+    setPayForm({ tailor: "", amount: "" });
+    setPayOpen(false);
+  };
+
+  return (
+    <div>
+      <div className="flex gap-1.5 mb-3">
+        {[["issue", "Issue"], ["receive", "Receive"], ["ledger", "Payouts"]].map(([id, label]) => (
+          <button key={id} onClick={() => setSubTab(id)} className={"text-xs font-semibold px-3 py-1.5 rounded-full " + (subTab === id ? "bg-[#1F2318] text-white" : "bg-white border border-black/10")}>{label}</button>
+        ))}
+      </div>
+      {subTab === "issue" && (
+        <Section title="Cut Pieces Issued to Tailors" right={<AddButton onClick={() => setIssueOpen(true)} label="Issue" />}>
+          {data.stitchIssues.length === 0 ? <EmptyState text="Nothing issued to tailors yet." /> : (
+            <div className="space-y-1.5">
+              {data.stitchIssues.map((iss) => (
+                <Card key={iss.id}>
+                  <div className="font-semibold text-sm">{iss.designName}</div>
+                  <div className="text-xs text-[#1F2318]/50">To {iss.tailorName} · Due {iss.promisedDate}</div>
+                  <div className="text-xs mt-1">{SIZES.map((s) => s + ":" + (iss.qty[s] || 0)).join("  ")}</div>
+                </Card>
+              ))}
+            </div>
+          )}
+        </Section>
+      )}
+      {subTab === "receive" && (
+        <Section title="Stitched Items Received" right={<AddButton onClick={() => setReceiveOpen(true)} label="Receive" />}>
+          {data.stitchReceipts.length === 0 ? <EmptyState text="No stitched items received yet." /> : (
+            <div className="space-y-1.5">
+              {data.stitchReceipts.map((r) => (
+                <Card key={r.id}>
+                  <div className="flex justify-between">
+                    <div className="font-semibold text-sm">{r.designName}</div>
+                    <div className="text-xs font-semibold">{money(r.stitchCost)}/pc</div>
+                  </div>
+                  <div className="text-xs text-[#1F2318]/50">From {r.tailorName} · Rejected {r.rejected}</div>
+                  <div className="text-xs mt-1">{SIZES.map((s) => s + ":" + (r.qty[s] || 0)).join("  ")}</div>
+                </Card>
+              ))}
+            </div>
+          )}
+        </Section>
+      )}
+      {subTab === "ledger" && (
+        <Section title="Tailor Payout Ledger" right={<AddButton onClick={() => setPayOpen(true)} label="Log Payment" />}>
+          {derived.tailorLedger.length === 0 ? <EmptyState text="No tailor activity yet." /> : (
+            <div className="space-y-1.5">
+              {derived.tailorLedger.map((t, i) => (
+                <Card key={i}>
+                  <div className="flex justify-between items-center">
+                    <div className="font-semibold text-sm">👤 {t.name}</div>
+                    <div className="text-xs">{t.pieces} pcs</div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 mt-2 text-xs">
+                    <div><div className="text-[#1F2318]/40">Payable</div><div className="font-bold">{money(t.payable)}</div></div>
+                    <div><div className="text-[#1F2318]/40">Paid</div><div className="font-bold">{money(t.paid)}</div></div>
+                    <div><div className="text-[#1F2318]/40">Balance</div><div className={"font-bold " + (t.payable - t.paid > 0 ? "text-red-600" : "")}>{money(t.payable - t.paid)}</div></div>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+        </Section>
+      )}
+      {issueOpen && (
+        <Modal title="Issue to Tailor" onClose={() => setIssueOpen(false)}>
+          <Field label="Tailor Name"><TextInput value={issueForm.tailor} onChange={(e) => setIssueForm({ ...issueForm, tailor: e.target.value })} /></Field>
+          <Field label="Design Name">
+            <SelectInput value={issueForm.design} onChange={(e) => setIssueForm({ ...issueForm, design: e.target.value })}>
+              <option value="">Choose design…</option>
+              {[...new Set(availableDesigns.map((d) => d.design))].map((d) => <option key={d} value={d}>{d}</option>)}
+            </SelectInput>
+          </Field>
+          <Field label="Quantities per Size"><SizeGrid value={issueForm.qty} onChange={(v) => setIssueForm({ ...issueForm, qty: v })} /></Field>
+          <Field label="Promised Delivery Date"><TextInput type="date" value={issueForm.date} onChange={(e) => setIssueForm({ ...issueForm, date: e.target.value })} /></Field>
+          <button onClick={saveIssue} className="w-full bg-[#1F2318] text-[#F5F3EE] font-semibold py-2.5 rounded-lg mt-1">Save</button>
+        </Modal>
+      )}
+      {receiveOpen && (
+        <Modal title="Receive Stitched Items" onClose={() => setReceiveOpen(false)}>
+          <Field label="Tailor Name"><TextInput value={recvForm.tailor} onChange={(e) => setRecvForm({ ...recvForm, tailor: e.target.value })} /></Field>
+          <Field label="Design Name"><TextInput value={recvForm.design} onChange={(e) => setRecvForm({ ...recvForm, design: e.target.value })} /></Field>
+          <Field label="Quantity Completed by Size"><SizeGrid value={recvForm.qty} onChange={(v) => setRecvForm({ ...recvForm, qty: v })} /></Field>
+          <Field label="Rejected / Damaged Pieces"><TextInput type="number" value={recvForm.rejected} onChange={(e) => setRecvForm({ ...recvForm, rejected: e.target.value })} /></Field>
+          <Field label="Stitching Cost per Piece"><TextInput type="number" value={recvForm.stitchCost} onChange={(e) => setRecvForm({ ...recvForm, stitchCost: e.target.value })} /></Field>
+          <Field label="Trim/Accessory Cost per Piece"><TextInput type="number" value={recvForm.trimCost} onChange={(e) => setRecvForm({ ...recvForm, trimCost: e.target.value })} /></Field>
+          <button onClick={saveReceive} className="w-full bg-[#1F2318] text-[#F5F3EE] font-semibold py-2.5 rounded-lg mt-1">Save</button>
+        </Modal>
+      )}
+      {payOpen && (
+        <Modal title="Log Tailor Payment" onClose={() => setPayOpen(false)}>
+          <Field label="Tailor Name"><TextInput value={payForm.tailor} onChange={(e) => setPayForm({ ...payForm, tailor: e.target.value })} /></Field>
+          <Field label="Amount Paid"><TextInput type="number" value={payForm.amount} onChange={(e) => setPayForm({ ...payForm, amount: e.target.value })} /></Field>
+          <button onClick={savePayment} className="w-full bg-[#1F2318] text-[#F5F3EE] font-semibold py-2.5 rounded-lg mt-1">Save Payment</button>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function FinishedPage({ data, update, derived }) {
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({ design: "", size: "S", type: "Single polybag", tag: "", qty: "" });
+  const [filterSize, setFilterSize] = useState("ALL");
+  const readyToPackage = derived.stitchedPool.filter((s) => (s.completed || 0) - (s.packaged || 0) > 0);
+  const save = () => {
+    if (!form.design || !form.qty) return;
+    update("packagingRecords", (arr) => [...arr, { id: uid(), designName: form.design, size: form.size, packagingType: form.type, tagId: form.tag || ("TAG-" + (arr.length + 1)), qty: Number(form.qty), date: todayISO() }]);
+    setForm({ design: "", size: "S", type: "Single polybag", tag: "", qty: "" });
+    setOpen(false);
+  };
+  const rows = derived.finishedStock.filter((f) => f.qty > 0 && (filterSize === "ALL" || f.size === filterSize));
+  return (
+    <div>
+      <Section title="Package Stitched Items" right={<AddButton onClick={() => setOpen(true)} label="Package" />}>
+        {readyToPackage.length === 0 ? <EmptyState text="Nothing ready to package yet." /> : (
+          <div className="text-xs text-[#1F2318]/50 mb-1">{readyToPackage.length} design/size combos ready to package</div>
+        )}
+      </Section>
+      <Section title="Finished Ready Stock" right={
+        <SelectInput value={filterSize} onChange={(e) => setFilterSize(e.target.value)} className="!w-auto text-xs py-1">
+          <option value="ALL">All sizes</option>
+          {SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
+        </SelectInput>
+      }>
+        {rows.length === 0 ? <EmptyState text="No finished stock yet." /> : (
+          <div className="space-y-1.5">
+            {rows.map((f, i) => (
+              <Card key={i} className="flex justify-between items-center">
+                <div>
+                  <div className="font-semibold text-sm">{f.design}</div>
+                  <div className="text-xs text-[#1F2318]/50">Size {f.size} · Landed cost {money(f.landedCost)}</div>
+                </div>
+                <div className="text-right font-bold">{f.qty}</div>
+              </Card>
+            ))}
+          </div>
+        )}
+      </Section>
+      {open && (
+        <Modal title="Package & Label" onClose={() => setOpen(false)}>
+          <Field label="Select Stitched Design">
+            <SelectInput value={form.design} onChange={(e) => setForm({ ...form, design: e.target.value })}>
+              <option value="">Choose…</option>
+              {[...new Set(readyToPackage.map((r) => r.design))].map((d) => <option key={d} value={d}>{d}</option>)}
+            </SelectInput>
+          </Field>
+          <Field label="Size">
+            <SelectInput value={form.size} onChange={(e) => setForm({ ...form, size: e.target.value })}>
+              {SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
+            </SelectInput>
+          </Field>
+          <Field label="Packaging Type">
+            <SelectInput value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}>
+              <option>Single polybag</option><option>Box set</option>
+            </SelectInput>
+          </Field>
+          <Field label="Package Tag/Barcode ID"><TextInput value={form.tag} onChange={(e) => setForm({ ...form, tag: e.target.value })} placeholder="Optional" /></Field>
+          <Field label="Quantity"><TextInput type="number" value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
+          <button onClick={save} className="w-full bg-[#1F2318] text-[#F5F3EE] font-semibold py-2.5 rounded-lg mt-1">Save</button>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function SalesPage({ data, update, derived }) {
+  const [open, setOpen] = useState(false);
+  const [subTab, setSubTab] = useState("record");
+  const [form, setForm] = useState({ customer: "", channel: "Retail", design: "", size: "S", qty: "", price: "", status: "Paid", mode: "Cash" });
+  const stockFor = (design, size) => {
+    const f = derived.finishedStock.find((x) => x.design === design && x.size === size);
+    return f ? f.qty : 0;
+  };
+  const save = () => {
+    if (!form.design || !form.qty || !form.price) return;
+    update("sales", (arr) => [...arr, { id: uid(), customer: form.customer, channel: form.channel, designName: form.design, size: form.size, qty: Number(form.qty), price: Number(form.price), paymentStatus: form.status, paymentMode: form.mode, date: todayISO() }]);
+    setForm({ customer: "", channel: "Retail", design: "", size: "S", qty: "", price: "", status: "Paid", mode: "Cash" });
+    setOpen(false);
+  };
+  const designOptions = [...new Set(derived.finishedStock.filter((f) => f.qty > 0).map((f) => f.design))];
+  return (
+    <div>
+      <div className="flex gap-1.5 mb-3">
+        {[["record", "Sales"], ["analytics", "Profit"]].map(([id, label]) => (
+          <button key={id} onClick={() => setSubTab(id)} className={"text-xs font-semibold px-3 py-1.5 rounded-full " + (subTab === id ? "bg-[#1F2318] text-white" : "bg-white border border-black/10")}>{label}</button>
+        ))}
+      </div>
+      {subTab === "record" && (
+        <Section title="Sales" right={<AddButton onClick={() => setOpen(true)} label="Record Sale" />}>
+          {data.sales.length === 0 ? <EmptyState text="No sales recorded yet." /> : (
+            <div className="space-y-1.5">
+              {[...data.sales].reverse().map((s) => (
+                <Card key={s.id} className="flex justify-between items-center">
+                  <div>
+                    <div className="font-semibold text-sm">{s.designName} · {s.size}</div>
+                    <div className="text-xs text-[#1F2318]/50">{s.customer || s.channel} · {s.date}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-bold">{money(s.qty * s.price)}</div>
+                    <div className="text-[10px] text-[#1F2318]/40">{s.paymentStatus}</div>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+        </Section>
+      )}
+      {subTab === "analytics" && (
+        <Section title="Sales & Profit Analytics">
+          {derived.salesByDesign.length === 0 ? <EmptyState text="Record a sale to see profit analytics." /> : (
+            <div className="space-y-1.5">
+              {derived.salesByDesign.map((d, i) => {
+                const profit = d.revenue - d.cost;
+                const margin = d.revenue > 0 ? (profit / d.revenue) * 100 : 0;
+                return (
+                  <Card key={i}>
+                    <div className="flex justify-between items-center">
+                      <div className="font-semibold text-sm">{d.design}</div>
+                      <div className={"text-xs font-bold " + (profit >= 0 ? "text-green-700" : "text-red-600")}>{margin.toFixed(0)}%</div>
+                    </div>
+                    <div className="grid grid-cols-4 gap-1 mt-2 text-xs">
+                      <div><div className="text-[#1F2318]/40">Sold</div><div className="font-bold">{d.qty}</div></div>
+                      <div><div className="text-[#1F2318]/40">Revenue</div><div className="font-bold">{money(d.revenue)}</div></div>
+                      <div><div className="text-[#1F2318]/40">Cost</div><div className="font-bold">{money(d.cost)}</div></div>
+                      <div><div className="text-[#1F2318]/40">Profit</div><div className={"font-bold " + (profit >= 0 ? "text-green-700" : "text-red-600")}>{money(profit)}</div></div>
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </Section>
+      )}
+      {open && (
+        <Modal title="Record Sale" onClose={() => setOpen(false)}>
+          <Field label="Customer Name / Channel"><TextInput value={form.customer} onChange={(e) => setForm({ ...form, customer: e.target.value })} placeholder="Optional customer name" /></Field>
+          <Field label="Channel">
+            <SelectInput value={form.channel} onChange={(e) => setForm({ ...form, channel: e.target.value })}>
+              <option>Retail</option><option>Wholesale</option><option>Online</option>
+            </SelectInput>
+          </Field>
+          <Field label="Design">
+            <SelectInput value={form.design} onChange={(e) => setForm({ ...form, design: e.target.value })}>
+              <option value="">Choose…</option>
+              {designOptions.map((d) => <option key={d} value={d}>{d}</option>)}
+            </SelectInput>
+          </Field>
+          <Field label="Size">
+            <SelectInput value={form.size} onChange={(e) => setForm({ ...form, size: e.target.value })}>
+              {SIZES.map((s) => <option key={s} value={s}>{s} (in stock: {stockFor(form.design, s)})</option>)}
+            </SelectInput>
+          </Field>
+          <Field label="Quantity Sold"><TextInput type="number" value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
+          <Field label="Selling Price per Unit"><TextInput type="number" value={form.price} onChange={(e) => setForm({ ...form, price: e.target.value })} /></Field>
+          <Field label="Payment Status">
+            <SelectInput value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}>
+              <option>Paid</option><option>Partial</option><option>Credit</option>
+            </SelectInput>
+          </Field>
+          <Field label="Payment Mode">
+            <SelectInput value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value })}>
+              <option>Cash</option><option>UPI</option><option>Bank Transfer</option><option>Card</option>
+            </SelectInput>
+          </Field>
+          <button onClick={save} className="w-full bg-[#1F2318] text-[#F5F3EE] font-semibold py-2.5 rounded-lg mt-1">Save Sale</button>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<GarmentTracker />);
+</script>
+</body>
+</html>
